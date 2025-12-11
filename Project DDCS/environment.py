@@ -1,157 +1,257 @@
-"""
-env_module.py
---------------
-Environment module for Modular Wastewater Simulation
+# environment.py
+# -------------------------------------------------------------------
+# Modul ini mendefinisikan Environment simulasi sistem daur ulang air.
+# Environment mengatur:
+# - Stok air daur ulang
+# - Pemakaian air PDAM dan konversinya menjadi air daur ulang
+# - Evaporasi, overflow, serta mekanisme waktu (jam & hari)
+# - Perhitungan reward
+# -------------------------------------------------------------------
 
-Contains:
-- SensorModule: simulates daily inflow and demand patterns.
-- RewardModule: defines reward function for reinforcement learning.
-- WastewaterEnv: main environment class combining sensor + reward.
-"""
-
-import numpy as np
 import random
 
-# ----------------------------
-# Sensor Module
-# ----------------------------
+# ===================================================================
+# SENSOR MODULE
+# ===================================================================
 class SensorModule:
+    """
+    Menghasilkan nilai demand (kebutuhan air) berdasarkan pola harian:
+    - Pagi & sore: demand tinggi
+    - Siang hari: demand menengah
+    - Malam: demand rendah
+    Terdapat sedikit noise acak untuk membuat simulasi lebih realistis.
+    """
+
     def __init__(self, seed=None):
-        if seed is not None:
-            random.seed(seed)
-            np.random.seed(seed)
+        self.rng = random.Random(seed)
 
-    def generate(self, hour, day):
-        """
-        Generate inflow (L) and demand (L) for given hour and day.
-        Pattern:
-        - Shower: morning & evening peaks
-        - Laundry: midday (weekend heavier)
-        - AC: small inflow midday
-        """
-        # Shower pattern
-        shower = 0.0
-        if 6 <= hour <= 8:
-            shower = random.uniform(5, 15)
-        elif 19 <= hour <= 21:
-            shower = random.uniform(3, 10)
+    def generate_demand(self, hour, day):
+        # nilai dasar demand (liter per langkah simulasi)
+        base = 5.0
 
-        # Laundry pattern
-        laundry = 0.0
-        if 13 <= hour <= 15:
-            laundry = random.uniform(10, 20) if day >= 5 else random.uniform(0, 5)
+        # jam dengan pemakaian air lebih tinggi
+        if 6 <= hour <= 9 or 17 <= hour <= 20:
+            base = 12.0
 
-        # AC condensation
-        ac = 0.0
-        if 11 <= hour <= 17:
-            ac = random.uniform(1, 4)
+        # jam siang, demand menengah
+        elif 11 <= hour <= 14:
+            base = 8.0
 
-        total_inflow = shower + laundry + ac
+        # tambahkan noise kecil
+        noise = self.rng.uniform(-1.5, 1.5)
 
-        # Demand pattern (household usage)
-        demand = 0.0
-        if 5 <= hour <= 22 and random.random() < 0.3:
-            demand = random.uniform(3, 7)
+        # demand minimal 0
+        return max(0.0, base + noise)
 
-        return total_inflow, demand
 
-# ----------------------------
-# Reward Module
-# ----------------------------
+# ===================================================================
+# REWARD MODULE
+# ===================================================================
 class RewardModule:
-    def __init__(self, tank_capacity):
-        self.cap = float(tank_capacity)
+    """
+    Menghitung reward berdasarkan:
+    - Demand terpenuhi (reward positif)
+    - Penggunaan PDAM (biaya → penalti)
+    - Shortage / unmet demand (penalti besar)
+    - Penggunaan recycled (bonus kecil)
+    Reward dikunci (clamp) agar tetap dalam -5 hingga 5.
+    """
 
-    def compute(self, fulfilled_demand, wasted_by_action, wasted_by_overflow, water_used_plants):
-        """
-        Compute reward in range [-1, 1]
-        Components:
-        + demand fulfillment (+)
-        + plant watering (+ small)
-        - manual release (−)
-        - overflow (− large)
-        """
-        r_fulfill = 0.6 * (1.0 if fulfilled_demand > 0 else 0.0)
-        r_plants = 0.2 * (water_used_plants / 20.0)
-        r_release = -0.3 * (wasted_by_action / 20.0)
-        r_overflow = -1.0 * (wasted_by_overflow / self.cap)
-        reward = r_fulfill + r_plants + r_release + r_overflow
-        return max(-1.0, min(1.0, reward))  # clip to [-1, 1]
+    def __init__(self, pdam_cost=2.5, shortage_penalty=2.0, recycled_bonus=1.5):
+        self.pdam_cost = pdam_cost
+        self.shortage_penalty = shortage_penalty
+        self.recycled_bonus = recycled_bonus
 
-# ----------------------------
-# Environment (Wastewater)
-# ----------------------------
-class WastewaterEnv:
-    def __init__(self, tank_capacity=100.0, release_amount=20.0, watering_amount=15.0, seed=None):
-        self.tank_capacity = float(tank_capacity)
-        self.release_amount = float(release_amount)
-        self.watering_amount = float(watering_amount)
+    def compute(self, demand, pdam_used, recycled_used):
+        reward = 0.0
+        total_supplied = pdam_used + recycled_used
+
+        # proporsi demand yang terpenuhi
+        fulfilled_ratio = min(1.0, total_supplied / (demand + 1e-9))
+        reward += fulfilled_ratio * 1.0
+
+        # penalti penggunaan PDAM
+        reward -= self.pdam_cost * (pdam_used / (demand + 1e-9))
+
+        # penalti shortage apabila suplai tidak mencukupi
+        if total_supplied < demand:
+            shortage = demand - total_supplied
+            reward -= self.shortage_penalty * (shortage / (demand + 1e-9))
+
+        # bonus penggunaan air recycle
+        reward += self.recycled_bonus * (recycled_used / (demand + 1e-9))
+
+        # batasi reward dalam rentang [-5, 5]
+        return max(-5.0, min(5.0, reward))
+
+
+# ===================================================================
+# ENVIRONMENT UTAMA
+# ===================================================================
+class WaterReuseEnv:
+    """
+    Environment simulasi pengelolaan air dengan 3 jenis aksi:
+      0 = USE_PDAM_ONLY        → seluruh demand dipenuhi dengan PDAM
+      1 = USE_RECYCLED_ONLY    → gunakan recycled; jika tidak cukup → shortage
+      2 = MIX_PREFER_RECYCLED  → gunakan recycled dulu, sisanya PDAM
+
+    Mekanisme tambahan:
+    - Sebagian air PDAM yang digunakan diolah menjadi recycled pada langkah berikutnya
+    - Air recycled mengalami evaporasi
+    - Kapasitas tank terbatas, overflow dihitung sebagai limbah
+    - Waktu bergerak per langkah: jam → hari
+    """
+
+    def __init__(
+        self,
+        tank_capacity=200.0,
+        initial_recycled=50.0,
+        treatment_rate=0.8,
+        recycled_evap_rate=0.005,
+        release_capacity=None,   # tidak digunakan dalam versi ini (disiapkan untuk opsi pengembangan)
+        seed=None
+    ):
+        # parameter utama simpanan air
+        self.tank_capacity = tank_capacity
+        self.recycled = float(initial_recycled)
+
+        # parameter proses
+        self.treatment_rate = treatment_rate    # fraksi PDAM yang akan menjadi recycled
+        self.recycled_evap_rate = recycled_evap_rate  # fraksi hilang karena evaporasi
+
+        # modul sensor & reward
         self.sensor = SensorModule(seed=seed)
-        self.reward_module = RewardModule(self.tank_capacity)
-        self.reset()
+        self.reward_module = RewardModule()
 
-    def reset(self):
-        """Reset environment to initial state"""
-        self.tank_level = 0.0
+        # penampung air recycle yang akan ditambahkan pada langkah berikutnya
+        self.pending_recycled = 0.0
+
+        # modul random
+        self.rng = random.Random(seed)
+
+        # waktu simulasi (dimulai dari 0)
         self.hour = 0
         self.day = 0
-        return (self.tank_level, self.hour, self.day)
 
+    # -------------------------------------------------------------------
+    # RESET ENVIRONMENT
+    # -------------------------------------------------------------------
+    def reset(self):
+        """
+        Reset environment ke kondisi awal.
+        State format:
+        (pdam_used_prev, recycled_stock, hour, day)
+        """
+        self.recycled = max(0.0, min(self.tank_capacity, self.recycled))
+        self.hour = 0
+        self.day = 0
+        self.pending_recycled = 0.0
+
+        return (0.0, self.recycled, self.hour, self.day)
+
+    # -------------------------------------------------------------------
+    # STEP FUNCTION (INTI ENVIRONMENT)
+    # -------------------------------------------------------------------
     def step(self, action):
         """
-        action: 0 = HOLD, 1 = RELEASE (waste), 2 = WATER_PLANTS
-        Returns:
-        next_state, reward, done, info
+        Melakukan satu langkah simulasi dengan aksi tertentu.
+
+        Output:
+        - next_state : (pdam_used_recent, recycled_level, hour, day)
+        - reward     : hasil perhitungan reward module
+        - done       : selalu False (simulasi tak terbatas)
+        - info       : dictionary berisi detail proses internal
         """
-        inflow, demand = self.sensor.generate(self.hour, self.day)
 
-        # Supply water for demand
-        water_supplied = min(self.tank_level, demand)
-        self.tank_level -= water_supplied
+        # -----------------------------------------------------------
+        # 1. Hitung demand berdasarkan jam & hari
+        # -----------------------------------------------------------
+        demand = self.sensor.generate_demand(self.hour, self.day)
 
-        # Add inflow to tank
-        self.tank_level += inflow
+        # Variabel untuk mencatat air yang digunakan
+        pdam_used = 0.0
+        recycled_used = 0.0
 
-        # Initialize
-        wasted_by_action = 0.0
-        water_used_plants = 0.0
+        # -----------------------------------------------------------
+        # 2. Eksekusi aksi
+        # -----------------------------------------------------------
+        if action == 0:  # PDAM only
+            pdam_used = demand
 
-        # Execute action
-        if action == 1:  # RELEASE
-            water_to_release = min(self.tank_level, self.release_amount)
-            self.tank_level -= water_to_release
-            wasted_by_action = water_to_release
+        elif action == 1:  # Recycled only
+            recycled_used = min(self.recycled, demand)
 
-        elif action == 2:  # WATER_PLANTS
-            water_to_use = min(self.tank_level, self.watering_amount)
-            self.tank_level -= water_to_use
-            water_used_plants = water_to_use
+        elif action == 2:  # Mixed – gunakan recycled dahulu
+            recycled_used = min(self.recycled, demand)
+            pdam_used = demand - recycled_used
 
-        # Overflow check
-        wasted_by_overflow = 0.0
-        if self.tank_level > self.tank_capacity:
-            wasted_by_overflow = self.tank_level - self.tank_capacity
-            self.tank_level = self.tank_capacity
+        else:
+            raise ValueError("Unknown action")
 
-        # Compute reward
+        # -----------------------------------------------------------
+        # 3. Update stok recycled berdasarkan penggunaan
+        # -----------------------------------------------------------
+        self.recycled -= recycled_used
+        self.recycled = max(0.0, self.recycled)
+
+        # -----------------------------------------------------------
+        # 4. Tambahkan hasil treatment dari PDAM (delay 1 langkah)
+        # -----------------------------------------------------------
+        treated = pdam_used * self.treatment_rate
+        self.pending_recycled += treated
+
+        # -----------------------------------------------------------
+        # 5. Terjadi evaporasi
+        # -----------------------------------------------------------
+        evap_loss = self.recycled * self.recycled_evap_rate
+        self.recycled -= evap_loss
+        self.recycled = max(0.0, self.recycled)
+
+        # -----------------------------------------------------------
+        # 6. Tambahkan pending recycled (bisa menyebabkan overflow)
+        # -----------------------------------------------------------
+        self.recycled += self.pending_recycled
+
+        if self.recycled > self.tank_capacity:
+            overflow = self.recycled - self.tank_capacity
+            self.recycled = self.tank_capacity
+        else:
+            overflow = 0.0
+
+        # pending recycled direset setiap langkah
+        self.pending_recycled = 0.0
+
+        # -----------------------------------------------------------
+        # 7. Hitung reward
+        # -----------------------------------------------------------
         reward = self.reward_module.compute(
-            water_supplied, wasted_by_action, wasted_by_overflow, water_used_plants
+            demand, pdam_used, recycled_used
         )
 
-        # Advance time
+        # -----------------------------------------------------------
+        # 8. Update waktu
+        # -----------------------------------------------------------
         self.hour = (self.hour + 1) % 24
         if self.hour == 0:
             self.day = (self.day + 1) % 7
 
-        next_state = (self.tank_level, self.hour, self.day)
+        # -----------------------------------------------------------
+        # 9. Susun next_state dan info
+        # -----------------------------------------------------------
+        next_state = (
+            pdam_used,
+            self.recycled,
+            self.hour,
+            self.day
+        )
+
         info = {
-            "inflow": inflow,
             "demand": demand,
-            "wasted_overflow": wasted_by_overflow,
-            "wasted_action": wasted_by_action,
-            "water_used_plants": water_used_plants,
-            "water_supplied": water_supplied,
+            "pdam_used": pdam_used,
+            "recycled_used": recycled_used,
+            "treated_added_next": treated,
+            "evap_loss": evap_loss,
+            "overflow": overflow
         }
 
-        done = False
-        return next_state, reward, done, info
+        return next_state, reward, False, info
