@@ -19,8 +19,7 @@ project/
 │── data.py               # Data collection
 │── model.py              # Training MLP
 │── qlearning_module.py   # Q-Learning + model-assisted shaping
-│── main.py               # Runner + visualisasi
-└── README.md
+└── main.py               # Runner + visualisasi
 ________________________________________
 Cara Menjalankan
 1. Install dependencies
