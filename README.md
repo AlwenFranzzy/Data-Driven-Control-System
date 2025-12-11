@@ -13,14 +13,6 @@ o	Recycled stock trace
 o	Tank visualization
 o	Recycle share per waktu
 ________________________________________
-Struktur Proyek
-project/
-│── environment.py        # Environment simulasi
-│── data.py               # Data collection
-│── model.py              # Training MLP
-│── qlearning_module.py   # Q-Learning + model-assisted shaping
-└── main.py               # Runner + visualisasi
-________________________________________
 Cara Menjalankan
 1. Install dependencies
 pip install numpy pandas scikit-learn matplotlib
